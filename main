@@ -1,0 +1,203 @@
+import streamlit as st
+import os
+import csv
+from datetime import datetime
+from langchain_openai import ChatOpenAI
+from langchain.schema import HumanMessage, AIMessage
+from langchain.prompts import ChatPromptTemplate
+from langchain.chains import LLMChain
+from dotenv import load_dotenv
+from langchain_community.vectorstores import FAISS
+from langchain_openai import OpenAIEmbeddings
+from langchain.chains import RetrievalQA
+from langchain.document_loaders import TextLoader
+import git  # pip install gitpython
+
+load_dotenv()
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+GITHUB_REPO_URL = os.getenv("https://github.com/sudhirshenoyk/regalium/blob/main/.env")  # Add your GitHub repository URL to .env or Streamlit secrets
+GITHUB_DEPLOY_KEY = os.getenv("SHA256:ipU2mUQ311I5e5N6Q0MGXZKTCkziZ7fRe1HImXyAR+c") # Add your private deploy key to Streamlit secrets
+REPO_LOCAL_PATH = "my-repo"  # Local directory to clone the repo
+
+llm = ChatOpenAI(openai_api_key=OPENAI_API_KEY)
+embeddings = OpenAIEmbeddings(openai_api_key=OPENAI_API_KEY)
+
+# --- Initialize Session State ---
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+if "onboarding_complete" not in st.session_state:
+    st.session_state.onboarding_complete = False
+if "user_info" not in st.session_state:
+    st.session_state.user_info = {}
+if "step" not in st.session_state:
+    st.session_state.step = 0
+if "data_saved" not in st.session_state:
+    st.session_state.data_saved = False
+if "repo_cloned" not in st.session_state:
+    st.session_state.repo_cloned = False
+
+# --- Onboarding Steps ---
+steps = [
+    {"prompt": "What is your name?", "key": "name"},
+    {"prompt": "What is your email address?", "key": "email"},
+    {"prompt": "What is your primary area of interest?", "key": "interest"},
+]
+
+def save_to_csv(user_data):
+    CSV_FILE = "user_data.csv"
+    file_exists = os.path.isfile(CSV_FILE)
+    try:
+        with open(CSV_FILE, 'a', newline='') as csvfile:
+            fieldnames = user_data.keys()
+            writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+            if not file_exists:
+                writer.writeheader()
+            writer.writerow(user_data)
+        st.success(f"User data saved to {CSV_FILE}")
+        return True
+    except Exception as e:
+        st.error(f"Error saving to CSV: {e}")
+        return False
+
+def clone_github_repo():
+    if not os.path.exists(REPO_LOCAL_PATH):
+        try:
+            with open("id_rsa", "w") as f:
+                f.write(GITHUB_DEPLOY_KEY)
+            os.chmod("id_rsa", 0o600)  # Set correct permissions
+
+            repo_url_with_auth = GITHUB_REPO_URL.replace("https://", f"git@github.com:") # Assuming HTTPS URL
+            repo = git.Repo.clone_from(f"ssh://git@github.com/{GITHUB_REPO_URL.split('/')[-2]}/{GITHUB_REPO_URL.split('/')[-1].replace('.git', '')}", REPO_LOCAL_PATH, ssh_cmd='ssh -i id_rsa')
+            st.session_state.repo_cloned = True
+            os.remove("id_rsa") # Remove the temporary private key
+            st.success("GitHub repository cloned successfully.")
+            return True
+        except Exception as e:
+            st.error(f"Error cloning GitHub repository: {e}")
+            if os.path.exists("id_rsa"):
+                os.remove("id_rsa")
+            return False
+    else:
+        st.session_state.repo_cloned = True
+        return True
+
+def commit_and_push():
+    if st.session_state.repo_cloned:
+        try:
+            repo = git.Repo(REPO_LOCAL_PATH)
+            repo.index.add(["user_data.csv"])
+            commit_message = f"Add user data - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+            repo.index.commit(commit_message)
+            origin = repo.remote(name='origin')
+            with open("id_rsa", "w") as f:
+                f.write(GITHUB_DEPLOY_KEY)
+            os.chmod("id_rsa", 0o600)
+            origin.push(ssh_cmd='ssh -i id_rsa')
+            os.remove("id_rsa")
+            st.success("User data committed and pushed to GitHub.")
+            return True
+        except Exception as e:
+            st.error(f"Error committing and pushing to GitHub: {e}")
+            if os.path.exists("id_rsa"):
+                os.remove("id_rsa")
+            return False
+    else:
+        st.warning("GitHub repository not cloned yet.")
+        return False
+
+# --- Main App Flow ---
+if not st.session_state.onboarding_complete:
+    st.title("Welcome!")
+    if st.session_state.step < len(steps):
+        step = steps[st.session_state.step]
+        user_input = st.text_input(step["prompt"], key=f"input_{step['key']}")
+        if st.button("Next"):
+            st.session_state.user_info[step["key"]] = user_input
+            st.session_state.step += 1
+            st.rerun()
+    else:
+        st.session_state.onboarding_complete = True
+        st.rerun()
+else:
+    # Onboarding complete
+    if not st.session_state.repo_cloned:
+        st.warning("To enable saving data to GitHub, you need to set up a deploy key.")
+        st.markdown("""
+            **Setup Instructions:**
+
+            1.  **Generate SSH Key:** Open your terminal and run:
+                ```bash
+                ssh-keygen -t rsa -b 4096 -N "" -f deploy_key
+                ```
+            2.  **Copy Private Key:** Copy the entire contents of the `deploy_key` file.
+            3.  **Set Streamlit Secret:** In your Streamlit app's settings, add a secret named `GITHUB_DEPLOY_KEY` and paste the private key.
+            4.  **Copy Public Key:** Copy the entire contents of the `deploy_key.pub` file.
+            5.  **Add Deploy Key to GitHub:** Go to your GitHub repository's settings, then "Deploy keys," and add a new deploy key with **write access**. Paste the public key.
+            6.  **Set Repository URL:** Add a Streamlit secret named `GITHUB_REPO_URL` with your repository URL (e.g., `https://github.com/your_username/your_repo.git`).
+        """)
+
+        if st.button("Attempt GitHub Setup"):
+            if clone_github_repo():
+                if save_to_csv(st.session_state.user_info):
+                    commit_and_push()
+                    st.session_state.data_saved = True # Mark as saved after successful push
+                else:
+                    st.warning("Data saved locally but could not be pushed to GitHub.")
+            else:
+                st.warning("Data saved locally but could not clone GitHub repository.")
+                if save_to_csv(st.session_state.user_info):
+                    st.session_state.data_saved = True # Mark as saved locally
+    else:
+        if not st.session_state.data_saved:
+            if save_to_csv(st.session_state.user_info):
+                commit_and_push()
+                st.session_state.data_saved = True # Mark as saved after successful push
+            else:
+                st.warning("Data saved locally but could not be pushed to GitHub.")
+
+
+    if not any(
+        "Thanks for providing your details!" in msg["content"]
+        or "Thank you for sharing!" in msg["content"]
+        for msg in st.session_state.messages
+    ):
+        user_interest = st.session_state.user_info.get("interest", "")
+        custom_msg = (
+            f"Thank you for sharing! I see you're interested in {user_interest.lower()}. "
+            "How can I assist you further?"
+            if user_interest
+            else "Thank you for providing your details! How can I assist you further?"
+        )
+        st.session_state.messages.append(
+            {
+                "role": "assistant",
+                "content": custom_msg,
+            }
+        )
+        st.rerun()
+
+    # Chat mode after onboarding
+    st.title("Chat with the Bot")
+    for msg in st.session_state.messages:
+        st.chat_message(msg["role"]).write(msg["content"])
+
+    if user_prompt := st.chat_input("Ask your question here..."):
+        st.session_state.messages.append({"role": "user", "content": user_prompt})
+        with st.chat_message("user"):
+            st.markdown(user_prompt)
+
+        with st.chat_message("assistant"):
+            with st.spinner("Thinking..."):
+                # Load data and create vectorstore
+                loader = TextLoader("knowledge_base.txt")
+                documents = loader.load()
+                vectorstore = FAISS.from_documents(documents, embeddings)
+                retriever = vectorstore.as_retriever()
+                rag_chain = RetrievalQA.from_chain_type(llm, retriever=retriever)
+
+                response = rag_chain.invoke({"query": user_prompt})
+                answer = (
+                    response["result"] if isinstance(response, dict) and "result" in response else str(response)
+                )
+                st.markdown(answer)
+        st.session_state.messages.append({"role": "assistant", "content": answer})
